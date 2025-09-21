@@ -172,6 +172,12 @@ app.get("/", (req, res) => {
   res.send("🚀Porinity server is running...");
 });
 
+// Get all biodata (with basic pagination)
+app.get("/biodata", async (req, res) => {
+    const result = await BiodataCollection.find().toArray();
+    res.send(result);
+});
+
 
 
 // ==================== LOCAL VS VERCEL ====================
