@@ -74,31 +74,35 @@ app.use(async (req, res, next) => {
 // ==================== AUTH (JWT) ====================
 
 // Issue tokens (Access + Refresh)
-app.post("/jwt", (req, res) => {
-  const user = req.body; // { email, uid, role, ... }
+app.post("/jwt", async(req, res) => {
+  const {email} = req.body; 
+  const userInfo = await UsersCollection.findOne({email: email});
+  const uid = userInfo.uid || ' ' ;
+  const userType = userInfo.userType || "basic";
+  const role = userInfo.role || "user";
+
+  payload = { email, uid, userType, role };
   const isProd = process.env.NODE_ENV === "production";
 
-  const accessToken = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
-    expiresIn: "15m",
-  });
-
-  const refreshToken = jwt.sign(user, process.env.REFRESH_TOKEN_SECRET, {
-    expiresIn: "7d",
-  });
+  const accessToken = jwt.sign(payload, process.env.ACCESS_TOKEN_SECRET, { expiresIn: "15m" });
+  const refreshToken = jwt.sign(payload, process.env.REFRESH_TOKEN_SECRET, { expiresIn: "7d" });
 
   res
     .cookie("accessToken", accessToken, {
       httpOnly: true,
       secure: isProd,
       sameSite: "strict",
+      path: "/",
     })
     .cookie("refreshToken", refreshToken, {
       httpOnly: true,
       secure: isProd,
       sameSite: isProd ? "none" : "strict",
+      path: "/",
     })
     .send({ success: true });
 });
+
 
 // Refresh token
 app.post("/refresh", (req, res) => {
@@ -176,6 +180,67 @@ app.get("/", (req, res) => {
 app.get("/biodata", async (req, res) => {
     const result = await BiodataCollection.find().toArray();
     res.send(result);
+});
+
+// Get biodata by id
+
+app.get('/biodata/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const doc = await BiodataCollection.findOne({ biodataId: id });
+    if (!doc) return res.status(404).json({ message: 'Biodata not found' });
+    res.json(doc);
+  } catch (err) {
+    console.error('Error fetching biodata by id:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Users Related Api
+app.post("/register", async (req, res) => {
+  const { email,uid,role,userType } = req.body;
+
+  // check if user already exists
+  const existingUser = await UsersCollection.findOne({ email });
+  if (existingUser) {
+    return res.status(400).json({ message: "User already exists" });
+  }
+
+  // create a new user document
+  const newUser = {
+    email,
+    uid,
+    userType,
+    role,
+    createdAt: new Date(),
+  };
+  const result = await UsersCollection.insertOne(newUser);
+
+  res.status(201).json({
+    success: true,
+    user: { email, uid, userType, role },
+  });
+});
+
+// get user by uid
+
+
+app.get('/users/:uid', async (req, res) => {
+  const { uid } = req.params;
+
+  if (!uid) {
+    return res.status(400).json({ message: 'UID is required' });
+  }
+
+  try {
+    const user = await UsersCollection.findOne({ uid });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json(user);
+  } catch (err) {
+    console.error('Error fetching user by uid:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
 
