@@ -224,8 +224,6 @@ app.post("/register", async (req, res) => {
 });
 
 // get user by uid
-
-
 app.get('/users/:uid', async (req, res) => {
   const { uid } = req.params;
 
@@ -242,6 +240,134 @@ app.get('/users/:uid', async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+// Add to fav api
+app.post('/favorites', async (req, res) => {
+  try {
+    const { biodataId, uid } = req.body ?? {};
+
+    if (!uid || !biodataId) {
+      return res.status(400).json({ message: 'uid and biodataId are required' });
+    }
+
+    const [user, biodata] = await Promise.all([
+      UsersCollection.findOne({ uid }),
+      BiodataCollection.findOne({ biodataId }),
+    ]);
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    if (!biodata) {
+      return res.status(404).json({ message: 'Biodata not found' });
+    }
+
+    const updateResult = await UsersCollection.updateOne(
+      { uid },
+      {
+        $addToSet: {
+          favorites: String(biodataId),
+        },
+      }
+    );
+
+    if (!updateResult.modifiedCount) {
+      return res.status(200).json({
+        success: true,
+        message: 'Biodata already present in favorites',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Biodata added to favorites',
+    });
+  } catch (err) {
+    console.error('Error adding favorite biodata:', err);
+    res.status(500).json({ message: 'Failed to add favorite' });
+  }
+});
+
+app.get('/favorites/:uid', async (req, res) => {
+  try {
+    const uid = req.params?.uid;
+
+    if (!uid) {
+      return res.status(400).json({ message: 'uid parameter is required' });
+    }
+
+    const user = await UsersCollection.findOne({ uid }, { projection: { favorites: 1 } });
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const favorites = Array.isArray(user.favorites) ? user.favorites : [];
+
+    if (!favorites.length) {
+      return res.json([]);
+    }
+
+    const favoriteBiodata = await BiodataCollection.find(
+      { biodataId: { $in: favorites } },
+      {
+        projection: {
+          _id: 0,
+          name: 1,
+          biodataId: 1,
+          permanentAddress: 1,
+          occupation: 1,
+        },
+      }
+    ).toArray();
+
+    res.json(favoriteBiodata);
+  } catch (err) {
+    console.error('Error fetching favorite biodatas:', err);
+    res.status(500).json({ message: 'Failed to fetch favorites' });
+  }
+});
+
+app.delete('/favorites', async (req, res) => {
+  try {
+    const { uid, biodataId } = req.body ?? {};
+
+    if (!uid || !biodataId) {
+      return res.status(400).json({ message: 'uid and biodataId are required' });
+    }
+
+    const updateResult = await UsersCollection.updateOne(
+      { uid },
+      {
+        $pull: {
+          favorites: String(biodataId),
+        },
+      }
+    );
+
+    if (!updateResult.matchedCount) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    if (!updateResult.modifiedCount) {
+      return res.status(200).json({
+        success: true,
+        message: 'Biodata was not in favorites',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Biodata removed from favorites',
+    });
+  } catch (err) {
+    console.error('Error removing favorite biodata:', err);
+    res.status(500).json({ message: 'Failed to remove favorite' });
+  }
+});
+
+
 
 
 
