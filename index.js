@@ -43,6 +43,7 @@ const client = new MongoClient(uri, {
 // Global collections
 let BiodataCollection;
 let UsersCollection;
+let ContactRequestsCollection;
 
 let isDBInitialized = false;
 
@@ -52,8 +53,9 @@ async function initDB() {
     const db = client.db("PorinityDB");
     
     // Initialize all collections
-    BiodataCollection = db.collection("BiodataCollection");
-    UsersCollection = db.collection("Users");
+  BiodataCollection = db.collection("BiodataCollection");
+  UsersCollection = db.collection("Users");
+  ContactRequestsCollection = db.collection("ContactRequests");
     
     isDBInitialized = true;
     console.log("✅ MongoDB connected and collections initialized");
@@ -367,6 +369,107 @@ app.delete('/favorites', async (req, res) => {
   }
 });
 
+// Checkout  req api
+app.post('/contact-requests', async (req, res) => {
+  try {
+    const {
+      biodataId,
+      requesterEmail,
+      requesterUid,
+      amount,
+      currency,
+      paymentProvider,
+      paymentMethod,
+      cardLast4,
+      status = 'pending',
+    } = req.body ?? {};
+
+    if (!biodataId || !requesterEmail || !requesterUid) {
+      return res.status(400).json({ message: 'biodataId, requesterEmail, and requesterUid are required' });
+    }
+
+    if (typeof amount !== 'number' || amount <= 0) {
+      return res.status(400).json({ message: 'amount must be a positive number' });
+    }
+
+    const last4Digits = String(cardLast4 || '').replace(/\D/g, '').slice(-4);
+    if (last4Digits.length !== 4) {
+      return res.status(400).json({ message: 'cardLast4 must contain the last four digits of the card' });
+    }
+
+    const biodata = await BiodataCollection.findOne({ biodataId: String(biodataId) });
+    if (!biodata) {
+      return res.status(404).json({ message: 'Referenced biodata not found' });
+    }
+
+    const existing = await ContactRequestsCollection.findOne({
+      biodataId: String(biodataId),
+      requesterUid,
+      status: { $in: ['pending', 'approved'] },
+    });
+
+    if (existing) {
+      return res.status(409).json({ message: 'A pending or approved request already exists for this biodata' });
+    }
+
+    const doc = {
+      biodataId: String(biodataId),
+      requesterEmail: String(requesterEmail).toLowerCase(),
+      requesterUid,
+      amount,
+      currency: currency || 'USD',
+      paymentProvider: paymentProvider || 'stripe',
+      paymentMethod: paymentMethod || 'card',
+      cardLast4: last4Digits,
+      status,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await ContactRequestsCollection.insertOne(doc);
+
+    res.status(201).json({
+      success: true,
+      requestId: result.insertedId,
+      message: 'Contact request submitted successfully',
+    });
+  } catch (err) {
+    console.error('Error creating contact request:', err);
+    res.status(500).json({ message: 'Failed to submit contact request' });
+  }
+});
+
+app.get('/contact-requests', async (req, res) => {
+  try {
+    const { requesterUid, status } = req.query ?? {};
+
+    const filter = {};
+    if (requesterUid) filter.requesterUid = requesterUid;
+    if (status) filter.status = status;
+
+    const requests = await ContactRequestsCollection.find(filter, {
+      projection: {
+        requesterEmail: 1,
+        requesterUid: 1,
+        biodataId: 1,
+        amount: 1,
+        currency: 1,
+        paymentProvider: 1,
+        paymentMethod: 1,
+        cardLast4: 1,
+        status: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      sort: { createdAt: -1 },
+    }).toArray();
+
+    res.json(requests);
+  } catch (err) {
+    console.error('Error fetching contact requests:', err);
+    res.status(500).json({ message: 'Failed to fetch contact requests' });
+  }
+});
 
 
 
