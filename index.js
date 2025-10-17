@@ -37,6 +37,7 @@ const client = new MongoClient(uri, {
 let BiodataCollection;
 let UsersCollection;
 let ContactRequestsCollection;
+let SuccessStoriesCollection;
 let isDBInitialized = false;
 
 async function initDB() {
@@ -47,6 +48,7 @@ async function initDB() {
     BiodataCollection = db.collection("BiodataCollection");
     UsersCollection = db.collection("Users");
     ContactRequestsCollection = db.collection("ContactRequests");
+  SuccessStoriesCollection = db.collection("SuccessStories");
 
     isDBInitialized = true;
     console.log("✅ MongoDB connected and collections initialized");
@@ -64,8 +66,17 @@ app.use(async (req, res, next) => {
 });
 
 // ==================== HELPERS ====================
-const sanitizeBiodata = (doc = {}) => {
-  const { _id, numericBiodataId, ...rest } = doc;
+const sanitizeBiodata = (doc = {}, options = {}) => {
+  const { includePayment = false } = options;
+  const { _id, numericBiodataId, premiumPayment, ...rest } = doc || {};
+
+  if (includePayment && premiumPayment) {
+    rest.premiumPayment = {
+      ...premiumPayment,
+      cardLast4: premiumPayment?.cardLast4 || null,
+    };
+  }
+
   return rest;
 };
 
@@ -89,10 +100,19 @@ const ensureOwnerOrAdmin = (req, res, uid) => {
   return false;
 };
 
+const ensureAdmin = (req, res) => {
+  if (req.user?.role === "admin") return true;
+  res.status(403).json({ message: "Admin access required" });
+  return false;
+};
+
 const getNextBiodataNumericId = async () => {
   const total = await BiodataCollection.countDocuments();
   return total + 1;
 };
+
+const PREMIUM_USER_FEE_USD = 50;
+const PREMIUM_BIODATA_FEE_USD = 10;
 
 // ==================== AUTH (JWT) ====================
 app.post("/jwt", async (req, res) => {
@@ -252,7 +272,7 @@ app.get("/biodata", async (req, res) => {
       .toArray();
 
     res.json({
-      data: records.map(sanitizeBiodata),
+      data: records.map((item) => sanitizeBiodata(item)),
       pagination: {
         total,
         page: safePage,
@@ -268,13 +288,38 @@ app.get("/biodata", async (req, res) => {
   }
 });
 
+app.get("/biodata/premium", async (req, res) => {
+  try {
+    const { limit = "6" } = req.query ?? {};
+    const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 6, 1), 24);
+
+    const records = await BiodataCollection.find({
+      premiumStatus: "approved",
+      isPublished: { $ne: false },
+    })
+      .sort({ premiumReviewedAt: -1, updatedAt: -1 })
+      .limit(safeLimit)
+      .toArray();
+
+    res.json({
+      data: records.map((item) => sanitizeBiodata(item)),
+      meta: {
+        count: records.length,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching premium biodata list:", err);
+    res.status(500).json({ message: "Failed to fetch premium biodata" });
+  }
+});
+
 app.get("/biodata/:id", async (req, res) => {
   const { id } = req.params;
 
   try {
     const doc = await BiodataCollection.findOne({ biodataId: id });
     if (!doc) return res.status(404).json({ message: "Biodata not found" });
-    res.json(doc);
+    res.json(sanitizeBiodata(doc));
   } catch (err) {
     console.error("Error fetching biodata by id:", err);
     res.status(500).json({ message: "Server error" });
@@ -283,7 +328,7 @@ app.get("/biodata/:id", async (req, res) => {
 
 // ==================== USER ROUTES ====================
 app.post("/register", async (req, res) => {
-  const { email, uid, role, userType } = req.body;
+  const { email, uid, role, userType } = req.body ?? {};
 
   const existingUser = await UsersCollection.findOne({ email });
   if (existingUser) {
@@ -293,15 +338,25 @@ app.post("/register", async (req, res) => {
   const newUser = {
     email,
     uid,
-    userType,
-    role,
+    userType: userType || "basic",
+    role: role || "user",
+    premiumUserStatus: "none",
+    premiumUserRequestedAt: null,
+    premiumUserApprovedAt: null,
+    premiumUserPayment: null,
     createdAt: new Date(),
+    updatedAt: new Date(),
   };
   await UsersCollection.insertOne(newUser);
 
   res.status(201).json({
     success: true,
-    user: { email, uid, userType, role },
+    user: {
+      email,
+      uid,
+      userType: newUser.userType,
+      role: newUser.role,
+    },
   });
 });
 
@@ -471,6 +526,680 @@ app.post("/users/profile", verifyToken, async (req, res) => {
   }
 });
 
+app.post("/users/premium-request", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    if (!uid) {
+      return res.status(403).json({ message: "User context missing" });
+    }
+
+    const {
+      amount,
+      currency,
+      paymentProvider,
+      paymentMethod,
+      cardLast4,
+      transactionId,
+    } = req.body ?? {};
+
+    const user = await UsersCollection.findOne({ uid });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.userType === "premium") {
+      return res.json({ success: true, message: "You are already a premium user" });
+    }
+
+    if (user.premiumUserStatus === "pending") {
+      return res.json({ success: true, message: "Premium user request already pending" });
+    }
+
+    const amountNumber = Number(amount);
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+      return res.status(400).json({ message: "amount must be a positive number" });
+    }
+
+    if (amountNumber !== PREMIUM_USER_FEE_USD) {
+      return res.status(400).json({ message: `Premium user upgrade costs $${PREMIUM_USER_FEE_USD}` });
+    }
+
+    const sanitizedCard = String(cardLast4 || "").replace(/\D/g, "").slice(-4);
+    if (sanitizedCard.length !== 4) {
+      return res.status(400).json({ message: "Provide the last four digits of the payment card" });
+    }
+
+    const now = new Date();
+
+    await UsersCollection.updateOne(
+      { uid },
+      {
+        $set: {
+          premiumUserStatus: "pending",
+          premiumUserRequestedAt: now,
+          premiumUserApprovedAt: null,
+          premiumUserPayment: {
+            amount: amountNumber,
+            currency: currency || "USD",
+            paymentProvider: paymentProvider || "stripe",
+            paymentMethod: paymentMethod || "card",
+            cardLast4: sanitizedCard,
+            transactionId: transactionId || null,
+            status: "pending",
+          },
+          updatedAt: now,
+        },
+      }
+    );
+
+    res.json({ success: true, message: "Premium user request submitted for review" });
+  } catch (err) {
+    console.error("Error submitting premium user request:", err);
+    res.status(500).json({ message: "Failed to submit premium user request" });
+  }
+});
+
+// ==================== ADMIN ROUTES ====================
+app.get("/admin/overview", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  try {
+    const [
+      totalBiodata,
+      maleBiodata,
+      femaleBiodata,
+      premiumBiodata,
+      pendingPremium,
+      premiumUsers,
+      pendingPremiumUsers,
+      pendingContactRequests,
+      contactRevenueAgg,
+      premiumBiodataRevenueAgg,
+      premiumUserRevenueAgg,
+    ] = await Promise.all([
+      BiodataCollection.countDocuments({}),
+      BiodataCollection.countDocuments({
+        biodataType: { $regex: /^male$/i },
+      }),
+      BiodataCollection.countDocuments({
+        biodataType: { $regex: /^female$/i },
+      }),
+      BiodataCollection.countDocuments({ premiumStatus: "approved" }),
+      BiodataCollection.countDocuments({ premiumStatus: "pending" }),
+      UsersCollection.countDocuments({ userType: "premium" }),
+      UsersCollection.countDocuments({ premiumUserStatus: "pending" }),
+      ContactRequestsCollection.countDocuments({ status: "pending" }),
+      ContactRequestsCollection.aggregate([
+        { $match: { status: "approved" } },
+        {
+          $project: {
+            amount: {
+              $toDouble: {
+                $ifNull: ["$amount", 0],
+              },
+            },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+      ]).toArray(),
+      BiodataCollection.aggregate([
+        {
+          $match: {
+            premiumStatus: "approved",
+            "premiumPayment.amount": { $exists: true },
+          },
+        },
+        {
+          $project: {
+            amount: {
+              $toDouble: {
+                $ifNull: ["$premiumPayment.amount", 0],
+              },
+            },
+            status: "$premiumPayment.status",
+          },
+        },
+        {
+          $match: {
+            amount: { $gt: 0 },
+            $or: [
+              { status: "approved" },
+              { status: { $exists: false } },
+            ],
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+      ]).toArray(),
+      UsersCollection.aggregate([
+        {
+          $match: {
+            premiumUserStatus: "approved",
+            "premiumUserPayment.amount": { $exists: true },
+          },
+        },
+        {
+          $project: {
+            amount: {
+              $toDouble: {
+                $ifNull: ["$premiumUserPayment.amount", 0],
+              },
+            },
+            status: "$premiumUserPayment.status",
+          },
+        },
+        {
+          $match: {
+            amount: { $gt: 0 },
+            $or: [
+              { status: "approved" },
+              { status: { $exists: false } },
+            ],
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+      ]).toArray(),
+    ]);
+
+      const contactRevenueStats = contactRevenueAgg?.[0] || { total: 0, count: 0 };
+      const premiumBiodataRevenueStats = premiumBiodataRevenueAgg?.[0] || { total: 0, count: 0 };
+      const premiumUserRevenueStats = premiumUserRevenueAgg?.[0] || { total: 0, count: 0 };
+      const totalRevenue =
+        (contactRevenueStats.total || 0) +
+        (premiumBiodataRevenueStats.total || 0) +
+        (premiumUserRevenueStats.total || 0);
+
+    res.json({
+      totals: {
+        totalBiodata,
+        maleBiodata,
+        femaleBiodata,
+        premiumBiodata,
+        pendingPremium,
+        premiumUsers,
+        pendingPremiumUsers,
+        pendingContactRequests,
+        approvedContactRequests: contactRevenueStats.count || 0,
+      },
+      revenue: {
+        totalRevenue,
+        contactRevenue: contactRevenueStats.total || 0,
+        premiumBiodataRevenue: premiumBiodataRevenueStats.total || 0,
+        premiumUserRevenue: premiumUserRevenueStats.total || 0,
+        contactRevenueCount: contactRevenueStats.count || 0,
+        premiumBiodataRevenueCount: premiumBiodataRevenueStats.count || 0,
+        premiumUserRevenueCount: premiumUserRevenueStats.count || 0,
+      },
+      chart: {
+        segments: [
+          { label: "Total Biodata", value: totalBiodata },
+          { label: "Male Biodata", value: maleBiodata },
+          { label: "Female Biodata", value: femaleBiodata },
+          { label: "Premium Biodata", value: premiumBiodata },
+        ],
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching admin overview:", err);
+    res.status(500).json({ message: "Failed to load admin overview" });
+  }
+});
+
+app.get("/admin/users", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  try {
+    const { search = "", page = "1", limit = "20" } = req.query ?? {};
+
+    const pageNumber = Math.max(parseInt(page, 10) || 1, 1);
+    const perPage = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+    const skip = (pageNumber - 1) * perPage;
+
+    const trimmedSearch = normalizeString(search);
+    const filter = {};
+
+    if (trimmedSearch) {
+      const regex = new RegExp(trimmedSearch, "i");
+      filter.$or = [{ displayName: regex }, { email: regex }];
+    }
+
+    const total = await UsersCollection.countDocuments(filter);
+
+    const rows = await UsersCollection.aggregate([
+      { $match: filter },
+      {
+        $lookup: {
+          from: "BiodataCollection",
+          localField: "uid",
+          foreignField: "uid",
+          as: "biodata",
+        },
+      },
+      {
+        $unwind: {
+          path: "$biodata",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      {
+        $project: {
+          uid: 1,
+          email: 1,
+          displayName: 1,
+          role: 1,
+          userType: 1,
+          createdAt: 1,
+          biodataId: "$biodata.biodataId",
+          premiumStatus: "$biodata.premiumStatus",
+          premiumRequestedAt: "$biodata.premiumRequestedAt",
+        },
+      },
+      { $sort: { createdAt: -1 } },
+      { $skip: skip },
+      { $limit: perPage },
+    ]).toArray();
+
+    res.json({
+      data: rows,
+      pagination: {
+        total,
+        page: pageNumber,
+        limit: perPage,
+        totalPages: Math.max(1, Math.ceil(total / perPage)),
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching users for admin:", err);
+    res.status(500).json({ message: "Failed to load users" });
+  }
+});
+
+app.post("/admin/users/:uid/make-admin", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  const { uid } = req.params;
+
+  if (!uid) {
+    return res.status(400).json({ message: "uid is required" });
+  }
+
+  try {
+    const result = await UsersCollection.updateOne(
+      { uid },
+      { $set: { role: "admin", updatedAt: new Date() } }
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.json({ success: true, message: "User promoted to admin" });
+  } catch (err) {
+    console.error("Error promoting user to admin:", err);
+    res.status(500).json({ message: "Failed to promote user" });
+  }
+});
+
+app.post("/admin/users/:uid/make-premium", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  const { uid } = req.params;
+
+  if (!uid) {
+    return res.status(400).json({ message: "uid is required" });
+  }
+
+  try {
+    const user = await UsersCollection.findOne({ uid });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.userType === "premium") {
+      return res.json({ success: true, message: "User already has premium access" });
+    }
+
+    const now = new Date();
+
+    await UsersCollection.updateOne(
+      { uid },
+      {
+        $set: {
+          userType: "premium",
+          premiumUserStatus: "approved",
+          premiumUserApprovedAt: now,
+          updatedAt: now,
+        },
+      }
+    );
+
+    res.json({ success: true, message: "User promoted to premium" });
+  } catch (err) {
+    console.error("Error promoting user to premium:", err);
+    res.status(500).json({ message: "Failed to promote user" });
+  }
+});
+
+app.get("/admin/premium-requests", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  try {
+    const requests = await BiodataCollection.aggregate([
+      { $match: { premiumStatus: "pending" } },
+      {
+        $lookup: {
+          from: "Users",
+          localField: "uid",
+          foreignField: "uid",
+          as: "user",
+        },
+      },
+      {
+        $unwind: {
+          path: "$user",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      {
+        $project: {
+          biodataId: 1,
+          name: "$name",
+          email: { $ifNull: ["$user.email", "$contactEmail", ""] },
+          uid: 1,
+          requestedAt: "$premiumRequestedAt",
+          amount: "$premiumPayment.amount",
+          currency: "$premiumPayment.currency",
+          cardLast4: "$premiumPayment.cardLast4",
+          paymentMethod: "$premiumPayment.paymentMethod",
+          paymentProvider: "$premiumPayment.paymentProvider",
+        },
+      },
+      { $sort: { premiumRequestedAt: 1, biodataId: 1 } },
+    ]).toArray();
+
+    res.json(requests);
+  } catch (err) {
+    console.error("Error fetching premium requests:", err);
+    res.status(500).json({ message: "Failed to load premium requests" });
+  }
+});
+
+app.get("/admin/premium-user-requests", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  try {
+    const requests = await UsersCollection.find({ premiumUserStatus: "pending" })
+      .sort({ premiumUserRequestedAt: 1, createdAt: 1 })
+      .toArray();
+
+    res.json(
+      requests.map((item) => ({
+        uid: item.uid,
+        email: item.email,
+        displayName: item.displayName || null,
+        requestedAt: item.premiumUserRequestedAt || null,
+        amount: item.premiumUserPayment?.amount || null,
+        currency: item.premiumUserPayment?.currency || "USD",
+        paymentMethod: item.premiumUserPayment?.paymentMethod || null,
+        paymentProvider: item.premiumUserPayment?.paymentProvider || null,
+        cardLast4: item.premiumUserPayment?.cardLast4 || null,
+      }))
+    );
+  } catch (err) {
+    console.error("Error fetching premium user requests:", err);
+    res.status(500).json({ message: "Failed to load premium user requests" });
+  }
+});
+
+app.post(
+  "/admin/premium-user-requests/:uid/approve",
+  verifyToken,
+  async (req, res) => {
+    if (!ensureAdmin(req, res)) return;
+
+    const { uid } = req.params;
+    if (!uid) {
+      return res.status(400).json({ message: "uid is required" });
+    }
+
+    try {
+      const user = await UsersCollection.findOne({ uid });
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      if (user.userType === "premium") {
+        return res.json({ success: true, message: "User is already premium" });
+      }
+
+      const now = new Date();
+
+      await UsersCollection.updateOne(
+        { uid },
+        {
+          $set: {
+            userType: "premium",
+            premiumUserStatus: "approved",
+            premiumUserApprovedAt: now,
+            updatedAt: now,
+            "premiumUserPayment.status": "approved",
+            "premiumUserPayment.approvedAt": now,
+          },
+        }
+      );
+
+      res.json({ success: true, message: "User promoted to premium" });
+    } catch (err) {
+      console.error("Error approving premium user request:", err);
+      res.status(500).json({ message: "Failed to approve premium user request" });
+    }
+  }
+);
+
+app.post(
+  "/admin/premium-requests/:biodataId/approve",
+  verifyToken,
+  async (req, res) => {
+    if (!ensureAdmin(req, res)) return;
+
+    const { biodataId } = req.params;
+
+    if (!biodataId) {
+      return res.status(400).json({ message: "biodataId is required" });
+    }
+
+    try {
+      const biodata = await BiodataCollection.findOne({ biodataId });
+      if (!biodata) {
+        return res.status(404).json({ message: "Biodata not found" });
+      }
+
+      if (biodata.premiumStatus === "approved") {
+        return res.json({ success: true, message: "Biodata already premium" });
+      }
+
+      const now = new Date();
+
+      await BiodataCollection.updateOne(
+        { biodataId },
+        {
+          $set: {
+            premiumStatus: "approved",
+            premiumReviewedAt: now,
+            premiumRequestedAt: biodata.premiumRequestedAt || now,
+            premiumBadgeActivatedAt: now,
+            updatedAt: now,
+            "premiumPayment.status": "approved",
+            "premiumPayment.approvedAt": now,
+          },
+        }
+      );
+
+      res.json({ success: true, message: "Premium request approved" });
+    } catch (err) {
+      console.error("Error approving premium request:", err);
+      res.status(500).json({ message: "Failed to approve premium request" });
+    }
+  }
+);
+
+app.get("/admin/contact-requests", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  try {
+    const { status = "pending" } = req.query ?? {};
+    const trimmedStatus = normalizeString(status);
+
+    const filter = {};
+    if (trimmedStatus && trimmedStatus.toLowerCase() !== "all") {
+      filter.status = trimmedStatus.toLowerCase();
+    }
+
+    const requests = await ContactRequestsCollection.aggregate([
+      { $match: filter },
+      {
+        $lookup: {
+          from: "Users",
+          localField: "requesterUid",
+          foreignField: "uid",
+          as: "user",
+        },
+      },
+      {
+        $unwind: {
+          path: "$user",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      {
+        $project: {
+          _id: 1,
+          biodataId: 1,
+          requesterUid: 1,
+          requesterEmail: 1,
+          status: 1,
+          amount: 1,
+          currency: 1,
+          createdAt: 1,
+          name: { $ifNull: ["$user.displayName", "$biodataName", ""] },
+          email: { $ifNull: ["$user.email", "$requesterEmail", ""] },
+        },
+      },
+      { $sort: { createdAt: -1 } },
+    ]).toArray();
+
+    res.json(
+      requests.map((item) => ({
+        id: item._id?.toString(),
+        biodataId: item.biodataId,
+        name: item.name,
+        email: item.email,
+        status: item.status,
+        amount: item.amount,
+        currency: item.currency,
+        createdAt: item.createdAt,
+      }))
+    );
+  } catch (err) {
+    console.error("Error fetching contact requests for admin:", err);
+    res.status(500).json({ message: "Failed to load contact requests" });
+  }
+});
+
+app.post(
+  "/admin/contact-requests/:id/approve",
+  verifyToken,
+  async (req, res) => {
+    if (!ensureAdmin(req, res)) return;
+
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({ message: "id is required" });
+    }
+
+    let objectId;
+    try {
+      objectId = new ObjectId(id);
+    } catch (err) {
+      return res.status(400).json({ message: "Invalid request id" });
+    }
+
+    try {
+      const requestDoc = await ContactRequestsCollection.findOne({
+        _id: objectId,
+      });
+
+      if (!requestDoc) {
+        return res.status(404).json({ message: "Contact request not found" });
+      }
+
+      if (requestDoc.status === "approved") {
+        return res.json({
+          success: true,
+          message: "Contact request already approved",
+        });
+      }
+
+      await ContactRequestsCollection.updateOne(
+        { _id: objectId },
+        {
+          $set: {
+            status: "approved",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      res.json({ success: true, message: "Contact request approved" });
+    } catch (err) {
+      console.error("Error approving contact request:", err);
+      res.status(500).json({ message: "Failed to approve contact request" });
+    }
+  }
+);
+
+app.get("/admin/success-stories", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  try {
+    const stories = await SuccessStoriesCollection.find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json(
+      stories.map((item) => ({
+        id: item._id?.toString(),
+        maleBiodataId: item.maleBiodataId || "",
+        femaleBiodataId: item.femaleBiodataId || "",
+        story: item.story || "",
+        title: item.title || "Success Story",
+        createdAt: item.createdAt || null,
+      }))
+    );
+  } catch (err) {
+    console.error("Error fetching success stories:", err);
+    res.status(500).json({ message: "Failed to load success stories" });
+  }
+});
+
 // ==================== BIODATA MANAGEMENT ====================
 app.get("/biodata/user/:uid", verifyToken, async (req, res) => {
   const { uid } = req.params;
@@ -481,7 +1210,7 @@ app.get("/biodata/user/:uid", verifyToken, async (req, res) => {
     return res.status(404).json({ message: "Biodata not found" });
   }
 
-  res.json(sanitizeBiodata(biodata));
+  res.json(sanitizeBiodata(biodata, { includePayment: true }));
 });
 
 app.post("/biodata", verifyToken, async (req, res) => {
@@ -601,6 +1330,8 @@ app.post("/biodata", verifyToken, async (req, res) => {
       premiumStatus: existing.premiumStatus || "none",
       premiumRequestedAt: existing.premiumRequestedAt || null,
       premiumReviewedAt: existing.premiumReviewedAt || null,
+      premiumBadgeActivatedAt: existing.premiumBadgeActivatedAt || null,
+      premiumPayment: existing.premiumPayment || null,
       createdAt: existing.createdAt || new Date(),
     };
 
@@ -627,6 +1358,8 @@ app.post("/biodata", verifyToken, async (req, res) => {
     premiumStatus: "none",
     premiumRequestedAt: null,
     premiumReviewedAt: null,
+    premiumBadgeActivatedAt: null,
+    premiumPayment: null,
     createdAt: new Date(),
   };
 
@@ -665,14 +1398,52 @@ app.post(
       });
     }
 
+    const {
+      amount,
+      currency,
+      paymentProvider,
+      paymentMethod,
+      cardLast4,
+      transactionId,
+    } = req.body ?? {};
+
+    const amountNumber = Number(amount);
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+      return res.status(400).json({ message: "amount must be a positive number" });
+    }
+
+    if (amountNumber !== PREMIUM_BIODATA_FEE_USD) {
+      return res
+        .status(400)
+        .json({ message: `Premium biodata upgrade costs $${PREMIUM_BIODATA_FEE_USD}` });
+    }
+
+    const sanitizedCard = String(cardLast4 || "").replace(/\D/g, "").slice(-4);
+    if (sanitizedCard.length !== 4) {
+      return res.status(400).json({ message: "Provide the last four digits of the payment card" });
+    }
+
+    const now = new Date();
+
     await BiodataCollection.updateOne(
       { _id: biodata._id },
       {
         $set: {
           premiumStatus: "pending",
-          premiumRequestedAt: new Date(),
+          premiumRequestedAt: now,
           premiumReviewedAt: null,
-          updatedAt: new Date(),
+          premiumPayment: {
+            amount: amountNumber,
+            currency: currency || "USD",
+            paymentProvider: paymentProvider || "stripe",
+            paymentMethod: paymentMethod || "card",
+            cardLast4: sanitizedCard,
+            transactionId: transactionId || null,
+            status: "pending",
+            requestedAt: now,
+          },
+          premiumBadgeActivatedAt: null,
+          updatedAt: now,
         },
       }
     );
