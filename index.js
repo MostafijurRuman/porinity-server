@@ -11,12 +11,30 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 // ==================== MIDDLEWARES ====================
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://your-client-app.web.app",
+  process.env.CLIENT_URL,
+  process.env.ADMIN_URL,
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:5173",
-      "https://your-client-app.web.app",
-    ],
+    origin(origin, callback) {
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      const isExplicitlyAllowed = allowedOrigins.includes(origin);
+      const matchesLocalhostPattern = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/i.test(origin);
+
+      if (isExplicitlyAllowed || matchesLocalhostPattern) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
   })
 );
@@ -38,6 +56,7 @@ let BiodataCollection;
 let UsersCollection;
 let ContactRequestsCollection;
 let SuccessStoriesCollection;
+let ContactMessagesCollection;
 let isDBInitialized = false;
 
 async function initDB() {
@@ -48,7 +67,8 @@ async function initDB() {
     BiodataCollection = db.collection("BiodataCollection");
     UsersCollection = db.collection("Users");
     ContactRequestsCollection = db.collection("ContactRequests");
-  SuccessStoriesCollection = db.collection("SuccessStories");
+    SuccessStoriesCollection = db.collection("SuccessStories");
+    ContactMessagesCollection = db.collection("ContactMessages");
 
     isDBInitialized = true;
     console.log("✅ MongoDB connected and collections initialized");
@@ -80,6 +100,15 @@ const sanitizeBiodata = (doc = {}, options = {}) => {
   return rest;
 };
 
+const sanitizeContactMessage = (doc = {}) => {
+  if (!doc || typeof doc !== "object") return {};
+  const { _id, ...rest } = doc;
+  return {
+    id: _id ? _id.toString() : undefined,
+    ...rest,
+  };
+};
+
 const extractNumericId = (value) => {
   const digits = String(value ?? "").replace(/[^0-9]/g, "");
   return digits ? Number(digits) : 0;
@@ -91,6 +120,63 @@ const normalizeString = (value) =>
 const normalizeNullableString = (value) => {
   const trimmed = normalizeString(value);
   return trimmed || "";
+};
+
+const toIsoOrNull = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+const sanitizeSuccessStory = (doc = {}) => {
+  if (!doc || typeof doc !== "object") return {};
+  const {
+    _id,
+    coupleNames = "",
+    brideName = "",
+    groomName = "",
+    story = "",
+    rating = 5,
+    marriageDate = null,
+    weddingCity = "",
+    heroImageUrl = "",
+    maleImageUrl = "",
+    femaleImageUrl = "",
+    status = "pending",
+    createdAt = null,
+    updatedAt = null,
+    approvedAt = null,
+    adminNote = "",
+    submittedBy = null,
+  } = doc;
+
+  const sanitizedSubmittedBy = submittedBy && typeof submittedBy === "object"
+    ? {
+        name: normalizeNullableString(submittedBy.name),
+        email: normalizeNullableString(submittedBy.email),
+        phone: normalizeNullableString(submittedBy.phone),
+      }
+    : undefined;
+
+  return {
+    id: _id ? _id.toString() : undefined,
+    coupleNames,
+    brideName,
+    groomName,
+    story,
+    rating,
+    marriageDate: toIsoOrNull(marriageDate),
+    weddingCity,
+    heroImageUrl,
+    maleImageUrl,
+    femaleImageUrl,
+    status,
+    createdAt,
+    updatedAt,
+    approvedAt,
+    adminNote,
+    submittedBy: sanitizedSubmittedBy,
+  };
 };
 
 const ensureOwnerOrAdmin = (req, res, uid) => {
@@ -215,6 +301,25 @@ app.get("/", (req, res) => {
   res.send("🚀Porinity server is running...");
 });
 
+app.get("/stats/biodata", async (req, res) => {
+  try {
+    const [total, female, male] = await Promise.all([
+      BiodataCollection.countDocuments({}),
+      BiodataCollection.countDocuments({ biodataType: { $regex: /^female$/i } }),
+      BiodataCollection.countDocuments({ biodataType: { $regex: /^male$/i } }),
+    ]);
+
+    res.json({
+      total,
+      female,
+      male,
+    });
+  } catch (err) {
+    console.error("Error fetching biodata stats:", err);
+    res.status(500).json({ message: "Failed to load biodata stats" });
+  }
+});
+
 app.get("/biodata", async (req, res) => {
   try {
     const {
@@ -323,6 +428,135 @@ app.get("/biodata/:id", async (req, res) => {
   } catch (err) {
     console.error("Error fetching biodata by id:", err);
     res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.get("/success-stories", async (req, res) => {
+  try {
+    const { limit = "12", status = "approved" } = req.query ?? {};
+    const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 12, 1), 60);
+    const normalizedStatus = normalizeString(status).toLowerCase() || "approved";
+
+    const filter = (() => {
+      if (normalizedStatus === "all") {
+        return { status: { $ne: "rejected" } };
+      }
+      if (normalizedStatus === "approved") {
+        return {
+          $or: [
+            { status: "approved" },
+            { status: { $exists: false } },
+          ],
+        };
+      }
+      return { status: normalizedStatus };
+    })();
+
+    const stories = await SuccessStoriesCollection.find(filter)
+      .sort({ approvedAt: -1, createdAt: -1 })
+      .limit(safeLimit)
+      .toArray();
+
+    res.json(stories.map((item) => sanitizeSuccessStory(item)));
+  } catch (err) {
+    console.error("Error fetching success stories:", err);
+    res.status(500).json({ message: "Failed to load success stories" });
+  }
+});
+
+app.post("/success-stories", async (req, res) => {
+  try {
+    const {
+      brideName,
+      groomName,
+      coupleNames,
+      story,
+      marriageDate,
+      weddingCity,
+      rating,
+      heroImageUrl,
+      maleImageUrl,
+      femaleImageUrl,
+      submitterName,
+      submitterEmail,
+      submitterPhone,
+    } = req.body ?? {};
+
+    const sanitizedBride = normalizeNullableString(brideName);
+    const sanitizedGroom = normalizeNullableString(groomName);
+    const sanitizedStory = normalizeNullableString(story);
+    const sanitizedCity = normalizeNullableString(weddingCity);
+    const sanitizedHeroImage = normalizeNullableString(heroImageUrl);
+    const sanitizedMaleImage = normalizeNullableString(maleImageUrl);
+    const sanitizedFemaleImage = normalizeNullableString(femaleImageUrl);
+    const sanitizedSubmitterName = normalizeNullableString(submitterName);
+    const normalizedEmail = normalizeString(submitterEmail).toLowerCase();
+    const sanitizedPhone = normalizeNullableString(submitterPhone);
+
+    if (sanitizedStory.length < 50) {
+      return res.status(400).json({ message: "Please share a story with at least 50 characters" });
+    }
+
+    if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return res.status(400).json({ message: "A valid contact email is required" });
+    }
+
+    const normalizedMarriageDate = normalizeString(marriageDate);
+    let marriageDateValue = null;
+    if (normalizedMarriageDate) {
+      const parsed = new Date(normalizedMarriageDate);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ message: "Provide a valid wedding date" });
+      }
+      marriageDateValue = parsed;
+    }
+
+    const ratingNumber = Number(rating);
+    const safeRating = Number.isFinite(ratingNumber)
+      ? Math.min(Math.max(Math.round(ratingNumber), 1), 5)
+      : 5;
+
+    const inferredCoupleNames = normalizeNullableString(coupleNames)
+      || [sanitizedGroom, sanitizedBride].filter(Boolean).join(" & ");
+
+    if (!inferredCoupleNames) {
+      return res.status(400).json({ message: "Please include the couple names" });
+    }
+
+    const now = new Date();
+    const doc = {
+      coupleNames: inferredCoupleNames,
+      brideName: sanitizedBride,
+      groomName: sanitizedGroom,
+      story: sanitizedStory,
+      rating: safeRating,
+      marriageDate: marriageDateValue,
+      weddingCity: sanitizedCity,
+      heroImageUrl: sanitizedHeroImage,
+      maleImageUrl: sanitizedMaleImage,
+      femaleImageUrl: sanitizedFemaleImage,
+      status: "pending",
+      createdAt: now,
+      updatedAt: now,
+      approvedAt: null,
+      adminNote: "",
+      submittedBy: {
+        name: sanitizedSubmitterName,
+        email: normalizedEmail,
+        phone: sanitizedPhone,
+      },
+    };
+
+    const result = await SuccessStoriesCollection.insertOne(doc);
+
+    res.status(201).json({
+      success: true,
+      message: "Thank you for sharing your journey. Our admin team will review it shortly.",
+      id: result.insertedId?.toString() || null,
+    });
+  } catch (err) {
+    console.error("Error submitting success story:", err);
+    res.status(500).json({ message: "Failed to submit success story" });
   }
 });
 
@@ -613,6 +847,8 @@ app.get("/admin/overview", verifyToken, async (req, res) => {
       premiumUsers,
       pendingPremiumUsers,
       pendingContactRequests,
+      openContactMessages,
+      pendingSuccessStories,
       contactRevenueAgg,
       premiumBiodataRevenueAgg,
       premiumUserRevenueAgg,
@@ -629,6 +865,12 @@ app.get("/admin/overview", verifyToken, async (req, res) => {
       UsersCollection.countDocuments({ userType: "premium" }),
       UsersCollection.countDocuments({ premiumUserStatus: "pending" }),
       ContactRequestsCollection.countDocuments({ status: "pending" }),
+      ContactMessagesCollection.countDocuments({
+        status: { $in: ["new", "in_progress"] },
+      }),
+      SuccessStoriesCollection.countDocuments({
+        status: { $in: ["pending", "under_review"] },
+      }),
       ContactRequestsCollection.aggregate([
         { $match: { status: "approved" } },
         {
@@ -736,6 +978,8 @@ app.get("/admin/overview", verifyToken, async (req, res) => {
         premiumUsers,
         pendingPremiumUsers,
         pendingContactRequests,
+        pendingContactMessages: openContactMessages,
+        pendingSuccessStories,
         approvedContactRequests: contactRevenueStats.count || 0,
       },
       revenue: {
@@ -1180,23 +1424,86 @@ app.get("/admin/success-stories", verifyToken, async (req, res) => {
   if (!ensureAdmin(req, res)) return;
 
   try {
-    const stories = await SuccessStoriesCollection.find({})
+    const { status = "pending" } = req.query ?? {};
+    const normalizedStatus = normalizeString(status).toLowerCase();
+    const filter = {};
+
+    if (normalizedStatus && normalizedStatus !== "all") {
+      if (normalizedStatus === "pending") {
+        filter.$or = [
+          { status: "pending" },
+          { status: { $exists: false } },
+        ];
+      } else {
+        filter.status = normalizedStatus;
+      }
+    }
+
+    const stories = await SuccessStoriesCollection.find(filter)
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.json(
-      stories.map((item) => ({
-        id: item._id?.toString(),
-        maleBiodataId: item.maleBiodataId || "",
-        femaleBiodataId: item.femaleBiodataId || "",
-        story: item.story || "",
-        title: item.title || "Success Story",
-        createdAt: item.createdAt || null,
-      }))
-    );
+    res.json(stories.map((item) => sanitizeSuccessStory(item)));
   } catch (err) {
     console.error("Error fetching success stories:", err);
     res.status(500).json({ message: "Failed to load success stories" });
+  }
+});
+
+app.patch("/admin/success-stories/:id/status", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  const { id } = req.params;
+  const { status, adminNote } = req.body ?? {};
+
+  if (!id) {
+    return res.status(400).json({ message: "Story id is required" });
+  }
+
+  let objectId;
+  try {
+    objectId = new ObjectId(id);
+  } catch (err) {
+    return res.status(400).json({ message: "Invalid story id" });
+  }
+
+  const normalizedStatus = normalizeString(status).toLowerCase();
+  const allowed = new Set(["pending", "under_review", "approved", "rejected"]);
+
+  if (!allowed.has(normalizedStatus)) {
+    return res.status(400).json({ message: "Invalid status value" });
+  }
+
+  const now = new Date();
+  const updateDoc = {
+    status: normalizedStatus,
+    updatedAt: now,
+    approvedAt: normalizedStatus === "approved" ? now : null,
+  };
+
+  if (typeof adminNote === "string") {
+    updateDoc.adminNote = normalizeNullableString(adminNote);
+  }
+
+  try {
+    const { value } = await SuccessStoriesCollection.findOneAndUpdate(
+      { _id: objectId },
+      { $set: updateDoc },
+      { returnDocument: "after" }
+    );
+
+    if (!value) {
+      return res.status(404).json({ message: "Success story not found" });
+    }
+
+    res.json({
+      success: true,
+      message: "Success story updated",
+      story: sanitizeSuccessStory(value),
+    });
+  } catch (err) {
+    console.error("Error updating success story status:", err);
+    res.status(500).json({ message: "Failed to update success story" });
   }
 });
 
@@ -1597,6 +1904,145 @@ app.delete("/favorites", verifyToken, async (req, res) => {
   } catch (err) {
     console.error("Error removing favorite biodata:", err);
     res.status(500).json({ message: "Failed to remove favorite" });
+  }
+});
+
+// ==================== CONTACT MESSAGES ====================
+app.post("/contact-messages", async (req, res) => {
+  try {
+    const {
+      name,
+      email,
+      channel,
+      message,
+    } = req.body ?? {};
+
+    const sanitizedName = normalizeNullableString(name);
+    if (!sanitizedName) {
+      return res.status(400).json({ message: "Name is required" });
+    }
+
+    const normalizedEmail = normalizeString(email).toLowerCase();
+    if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return res.status(400).json({ message: "A valid email address is required" });
+    }
+
+    const sanitizedMessage = normalizeNullableString(message);
+    if (!sanitizedMessage || sanitizedMessage.length < 10) {
+      return res.status(400).json({ message: "Please share a message with at least 10 characters" });
+    }
+
+    const sanitizedChannel = normalizeNullableString(channel) || "concierge";
+    const now = new Date();
+
+    const doc = {
+      name: sanitizedName,
+      email: normalizedEmail,
+      channel: sanitizedChannel.toLowerCase(),
+      message: sanitizedMessage,
+      status: "new",
+      source: "public",
+      createdAt: now,
+      updatedAt: now,
+      resolvedAt: null,
+      adminNote: "",
+      metadata: {
+        userAgent: normalizeNullableString(req.get("user-agent")) || null,
+        referer: normalizeNullableString(req.get("referer")) || null,
+        ip: normalizeNullableString(req.ip) || null,
+      },
+    };
+
+    const result = await ContactMessagesCollection.insertOne(doc);
+
+    res.status(201).json({
+      success: true,
+      message: "Thank you for contacting Porinity. Our concierge team will respond shortly.",
+      id: result.insertedId?.toString() || null,
+    });
+  } catch (err) {
+    console.error("Error submitting contact message:", err);
+    res.status(500).json({ message: "Failed to submit message" });
+  }
+});
+
+app.get("/admin/contact-messages", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  try {
+    const { status = "new" } = req.query ?? {};
+    const normalizedStatus = normalizeString(status).toLowerCase();
+
+    const filter = {};
+    if (normalizedStatus && normalizedStatus !== "all") {
+      filter.status = normalizedStatus;
+    }
+
+    const messages = await ContactMessagesCollection.find(filter)
+      .sort({ status: 1, createdAt: -1 })
+      .toArray();
+
+    res.json(messages.map((item) => sanitizeContactMessage(item)));
+  } catch (err) {
+    console.error("Error fetching contact messages:", err);
+    res.status(500).json({ message: "Failed to load contact messages" });
+  }
+});
+
+app.patch("/admin/contact-messages/:id", verifyToken, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  const { id } = req.params;
+  const { status, adminNote } = req.body ?? {};
+
+  if (!id) {
+    return res.status(400).json({ message: "Message id is required" });
+  }
+
+  let objectId;
+  try {
+    objectId = new ObjectId(id);
+  } catch (err) {
+    return res.status(400).json({ message: "Invalid message id" });
+  }
+
+  const normalizedStatus = normalizeString(status).toLowerCase();
+  const allowedStatuses = new Set(["new", "resolved", "in_progress"]);
+
+  if (!allowedStatuses.has(normalizedStatus)) {
+    return res.status(400).json({ message: "Invalid status value" });
+  }
+
+  const now = new Date();
+  const updateDoc = {
+    status: normalizedStatus,
+    updatedAt: now,
+    resolvedAt: normalizedStatus === "resolved" ? now : null,
+  };
+
+  if (typeof adminNote === "string") {
+    updateDoc.adminNote = normalizeNullableString(adminNote);
+  }
+
+  try {
+    const { value } = await ContactMessagesCollection.findOneAndUpdate(
+      { _id: objectId },
+      { $set: updateDoc },
+      { returnDocument: "after" }
+    );
+
+    if (!value) {
+      return res.status(404).json({ message: "Contact message not found" });
+    }
+
+    res.json({
+      success: true,
+      message: "Contact message updated",
+      contactMessage: sanitizeContactMessage(value),
+    });
+  } catch (err) {
+    console.error("Error updating contact message:", err);
+    res.status(500).json({ message: "Failed to update contact message" });
   }
 });
 
