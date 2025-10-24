@@ -13,26 +13,18 @@ const port = process.env.PORT || 5000;
 // ==================== MIDDLEWARES ====================
 const allowedOrigins = [
   "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  "https://your-client-app.web.app",
+  "https://porinity.firebaseapp.com",
+  "https://porinity.web.app",
   process.env.CLIENT_URL,
   process.env.ADMIN_URL,
 ].filter(Boolean);
 
 app.use(
   cors({
-    origin(origin, callback) {
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      const isExplicitlyAllowed = allowedOrigins.includes(origin);
-      const matchesLocalhostPattern = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/i.test(origin);
-
-      if (isExplicitlyAllowed || matchesLocalhostPattern) {
-        return callback(null, true);
-      }
-
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      if (/^http:\/\/(localhost|127\.0\.0\.1):\d+$/i.test(origin)) return callback(null, true);
       return callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
@@ -209,7 +201,6 @@ app.post("/jwt", async (req, res) => {
   const role = userInfo?.role || "user";
 
   const payload = { email, uid, userType, role };
-  const isProd = process.env.NODE_ENV === "production";
 
   const accessToken = jwt.sign(payload, process.env.ACCESS_TOKEN_SECRET, {
     expiresIn: "15m",
@@ -218,25 +209,26 @@ app.post("/jwt", async (req, res) => {
     expiresIn: "7d",
   });
 
+  // Always set cookies for cross-site: SameSite=None, Secure=true
   res
     .cookie("accessToken", accessToken, {
       httpOnly: true,
-      secure: isProd,
-      sameSite: "strict",
+      secure: true,
+      sameSite: "none",
       path: "/",
     })
     .cookie("refreshToken", refreshToken, {
       httpOnly: true,
-      secure: isProd,
-      sameSite: isProd ? "none" : "strict",
+      secure: true,
+      sameSite: "none",
       path: "/",
     })
+    .setHeader('Cache-Control', 'no-store')
     .send({ success: true });
 });
 
 app.post("/refresh", (req, res) => {
   const refreshToken = req.cookies?.refreshToken;
-  const isProd = process.env.NODE_ENV === "production";
 
   if (!refreshToken) {
     return res.status(401).send({ message: "No refresh token" });
@@ -254,28 +246,30 @@ app.post("/refresh", (req, res) => {
     res
       .cookie("accessToken", newAccessToken, {
         httpOnly: true,
-        secure: isProd,
-        sameSite: "strict",
+        secure: true,
+        sameSite: "none",
+        path: "/",
       })
+      .setHeader('Cache-Control', 'no-store')
       .send({ success: true });
   });
 });
 
 app.post("/logout", (req, res) => {
-  const isProd = process.env.NODE_ENV === "production";
   res
     .clearCookie("accessToken", {
       httpOnly: true,
-      secure: isProd,
-      sameSite: "strict",
+      secure: true,
+      sameSite: "none",
       path: "/",
     })
     .clearCookie("refreshToken", {
       httpOnly: true,
-      secure: isProd,
-      sameSite: "strict",
+      secure: true,
+      sameSite: "none",
       path: "/",
     })
+    .setHeader('Cache-Control', 'no-store')
     .send({ success: true });
 });
 
@@ -287,9 +281,8 @@ const verifyToken = (req, res, next) => {
 
   jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
     if (err) {
-      return res
-        .status(403)
-        .send({ message: "Access Token Expired or Invalid" });
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(403).send({ message: "Access Token Expired or Invalid" });
     }
     req.user = decoded;
     next();
@@ -398,13 +391,11 @@ app.get("/biodata/premium", async (req, res) => {
     const { limit = "6" } = req.query ?? {};
     const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 6, 1), 24);
 
-    const records = await BiodataCollection.find({
-      premiumStatus: "approved",
-      isPublished: { $ne: false },
-    })
-      .sort({ premiumReviewedAt: -1, updatedAt: -1 })
-      .limit(safeLimit)
-      .toArray();
+    // Use aggregation with $match and $sample for random selection
+    const records = await BiodataCollection.aggregate([
+      { $match: { premiumStatus: "approved", isPublished: { $ne: false } } },
+      { $sample: { size: safeLimit } },
+    ]).toArray();
 
     res.json({
       data: records.map((item) => sanitizeBiodata(item)),
